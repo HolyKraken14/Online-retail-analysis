@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Interactive Sales Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.2/echarts.min.js"></script>
+  <style>
+    .chart { width: 600px; height: 400px; margin: 20px auto; }
+  </style>
+</head>
+<body>
+  <h1>Interactive Sales Charts</h1>
+
+  <div id="dynamic_sales_trend-chart" class="chart"></div>
+  <div id="top_n_products-chart"      class="chart"></div>
+  <div id="category_distribution-chart" class="chart"></div>
+
+  <!-- this script is overwritten on each query -->
+  <script src="/static/chart_code.js"></script>
+</body>
+</html>
