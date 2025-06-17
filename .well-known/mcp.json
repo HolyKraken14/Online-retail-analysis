@@ -1,0 +1,9 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "Retail Data Tools",
+  "name_for_model": "retail_data_tools",
+  "description_for_human": "Summarise and query uploaded CSV files.",
+  "description_for_model": "Provides summarize_data and execute_sql_query on session-scoped CSV data.",
+  "model_context_server": { "url": "https://YOUR-DOMAIN/~mcp" },
+  "auth": { "type": "none" }
+}

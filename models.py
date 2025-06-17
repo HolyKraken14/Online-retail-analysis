@@ -36,7 +36,7 @@ class ChatSession(Base):
     created_at    = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at    = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
     is_active     = Column(Boolean, default=True, nullable=False)
-    
+    has_file      = Column(Boolean, default=False, nullable=False)
     # Relationships
     user          = relationship("User", back_populates="chat_sessions")
     messages      = relationship(

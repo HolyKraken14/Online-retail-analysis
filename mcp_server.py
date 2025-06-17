@@ -1,7 +1,7 @@
-# mcp_server.py - UPDATED VERSION
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import pandas as pd
@@ -10,6 +10,14 @@ import json
 import sqlite3
 import tempfile
 import os
+from sqlalchemy.orm import Session
+from models import Message
+from database import SessionLocal
+from sqlalchemy import cast, Text
+from sqlalchemy import func
+# Add these imports at the top
+
+from models import UploadedFile
 
 # --- Application Setup ---
 app = FastAPI(
@@ -28,7 +36,57 @@ app.add_middleware(
 
 # --- Tool Definitions ---
 
-def summarize_data(file_locations: List[str]) -> str:
+# ------------------ MCP integration helpers ------------------
+from typing import get_type_hints
+
+class ToolSpec(BaseModel):
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+
+
+import inspect
+
+def _build_parameters_schema(fn) -> Dict[str, Any]:
+    """Create a minimal JSON-Schema for a callable's signature usable by MCP."""
+    hints = get_type_hints(fn)
+    # Remove return annotation if present
+    hints.pop("return", None)
+
+    props: Dict[str, Any] = {}
+    required: list[str] = []
+    py_to_json = {
+        str: {"type": "string"},
+        int: {"type": "integer"},
+        float: {"type": "number"},
+        bool: {"type": "boolean"},
+        list: {"type": "array", "items": {"type": "string"}},  # default list mapping
+        dict: {"type": "object"},
+    }
+    sig = inspect.signature(fn)
+    for name, _typ in hints.items():
+        schema = py_to_json.get(_typ, {"type": "string"}).copy()
+        props[name] = schema
+        if sig.parameters[name].default is inspect.Parameter.empty:
+            required.append(name)
+
+    return {
+        "type": "object",
+        "properties": props,
+        "required": required,
+    }
+
+# Placeholder; will be populated after tool function definitions to avoid forward references
+_available_tools: Dict[str, Dict[str, Any]] = {}
+
+def _get_tool_callable(name: str):
+    entry = _available_tools.get(name)
+    return entry["func"] if entry else None
+
+# ------------------ end MCP helpers ------------------
+
+
+def summarize_data(file_locations: List[str], chat_session_id: Optional[str] = None) -> str:
     """Return a brief text summary of the dataset."""
     try:
         dfs = [pd.read_csv(p) for p in file_locations]
@@ -52,40 +110,44 @@ def summarize_data(file_locations: List[str]) -> str:
         raise HTTPException(status_code=500, detail=f"Error in summarize_data: {e}")
 
 
-def execute_sql_query(file_locations: List[str], sql_query: str) -> Dict:
-    """Execute SQL query on CSV files using SQLite."""
+def get_dataframe_from_session(chat_session_id: str) -> pd.DataFrame:
+    """Get combined DataFrame from all files in a chat session"""
+    db = SessionLocal()
     try:
-        print(f"Executing SQL query on files: {file_locations}")
+        # Get all files for this session
+        files = db.query(UploadedFile).filter(
+            UploadedFile.chat_session_id == chat_session_id
+        ).all()
+        
+        if not files:
+            raise ValueError(f"No files found for session {chat_session_id}")
+        
+        # Read and combine all CSVs
+        dfs = [pd.read_csv(f.file_path) for f in files]
+        return pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+    finally:
+        db.close()
+
+# Update the tool definitions
+def execute_sql_query(chat_session_id: str, sql_query: str) -> Dict:
+    """Execute SQL query on session data using SQLite."""
+    try:
+        print(f"Executing SQL query for session: {chat_session_id}")
         print(f"Raw SQL Query: {repr(sql_query)}")
         
-        # Check if files exist
-        for file_path in file_locations:
-            if not os.path.exists(file_path):
-                raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
-        
-        # Load the CSV file(s)
-        dfs = [pd.read_csv(p) for p in file_locations]
-        df = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
-        
+        # Get DataFrame from session
+        df = get_dataframe_from_session(chat_session_id)
         print(f"Loaded dataframe with shape: {df.shape}")
         print(f"Columns: {df.columns.tolist()}")
         
-        # Clean up the SQL query
+        # Clean up SQL query
         sql_query = sql_query.strip()
-        
-        # Remove any trailing semicolons and split by semicolon to handle multiple statements
         sql_statements = [stmt.strip() for stmt in sql_query.split(';') if stmt.strip()]
         
         if len(sql_statements) == 0:
             raise ValueError("No valid SQL statement found")
         
-        # Use only the first statement if multiple are present
-        if len(sql_statements) > 1:
-            print(f"Warning: Multiple SQL statements detected. Using only the first one.")
-            sql_query = sql_statements[0]
-        else:
-            sql_query = sql_statements[0]
-        
+        sql_query = sql_statements[0]
         print(f"Cleaned SQL Query: {sql_query}")
         
         # Create temporary SQLite database
@@ -93,18 +155,18 @@ def execute_sql_query(file_locations: List[str], sql_query: str) -> Dict:
             conn = sqlite3.connect(tmp.name)
             
             try:
-                # Write DataFrame to SQLite with the expected table name
+                # --- Normalize date column for SQLite compatibility ---
+                if 'InvoiceDate' in df.columns:
+                    try:
+                        df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception as _e:
+                        pass  # Leave as-is if conversion fails
                 df.to_sql('csv_table', conn, index=False, if_exists='replace')
-                
-                # Execute the query
                 cursor = conn.cursor()
                 cursor.execute(sql_query)
                 
-                # Fetch results
                 columns = [description[0] for description in cursor.description]
                 rows = cursor.fetchall()
-                
-                # Convert to list of dictionaries
                 result_data = [dict(zip(columns, row)) for row in rows]
                 
                 print(f"Query result: {len(result_data)} rows, {len(columns)} columns")
@@ -114,106 +176,61 @@ def execute_sql_query(file_locations: List[str], sql_query: str) -> Dict:
                     "columns": columns,
                     "row_count": len(result_data)
                 }
-                
             finally:
                 conn.close()
-                # Clean up temp file
                 try:
                     os.unlink(tmp.name)
                 except:
                     pass
-            
+                    
     except Exception as e:
         print(f"Error in execute_sql_query: {str(e)}")
         print(f"Error type: {type(e)}")
         raise HTTPException(status_code=500, detail=f"Error executing SQL: {e}")
 
+# ------------------ Register tools after definitions ------------------
+_available_tools.update({
+    "summarize_data": {
+        "func": summarize_data,
+        "description": "Return a brief textual summary of uploaded CSV data.",
+        "parameters": _build_parameters_schema(summarize_data),
+    },
+    "execute_sql_query": {
+        "func": execute_sql_query,
+        "description": "Run a SQL query against session-scoped CSV data.",
+        "parameters": _build_parameters_schema(execute_sql_query),
+    },
+})
+# ---------------------------------------------------------------------
 
-def generate_echart_config(
-    file_locations: List[str],
-    chart_type: str,
-    x_axis: Optional[str] = None,
-    y_axis: Optional[List[str]] = None,
-    filters: Optional[str] = None
-) -> Dict:
-    """Build an ECharts `option` dict for common charts."""
-    try:
-        # Check if files exist
-        for file_path in file_locations:
-            if not os.path.exists(file_path):
-                raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
-                
-        df = pd.read_csv(file_locations[0])
-        if filters:
-            df = df.query(filters)
-        
-        option: Dict[str, Any] = {"series": []}
-
-        if chart_type in ("line","bar") and x_axis and y_axis:
-            df_group = df.groupby(x_axis)[y_axis].sum().reset_index()
-            option.update({
-                "xAxis": {"type": "category", "data": df_group[x_axis].tolist()},
-                "yAxis": {"type": "value"},
-                "tooltip": {"trigger": "axis"},
-                "legend": {"data": y_axis},
-                "series": [
-                    {"name": y, "type": chart_type, "data": df_group[y].tolist()}
-                    for y in y_axis
-                ]
-            })
-        elif chart_type == "pie" and x_axis and y_axis and len(y_axis)==1:
-            data = (
-                df.groupby(x_axis)[y_axis[0]]
-                .sum().nlargest(10)
-                .reset_index()
-                .rename(columns={x_axis: "name", y_axis[0]: "value"})
-            )
-            option["series"] = [{
-                "type": "pie",
-                "data": data.to_dict("records"),
-                "radius": "50%"
-            }]
-            option["tooltip"] = {"trigger": "item"}
-            option["legend"] = {"orient": "vertical", "left": "left", "data": data["name"].tolist()}
-        else:
-            raise ValueError("Invalid chart_type or missing axes for chart generation.")
-
-        return option
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in generate_echart_config: {e}")
-
-
-# --- API Endpoint to Execute Tools ---
+# Update the tool request model
 class ToolExecutionRequest(BaseModel):
     tool_name: str = Field(..., description="The name of the tool to execute.")
     arguments: Dict[str, Any] = Field(..., description="The arguments for the tool.")
+    chat_session_id: Optional[str] | None = Field(None, description="Optional chat session ID if the tool requires it.")
 
+# Update the execute tool endpoint
 @app.post("/execute-tool")
 async def execute_tool(request: ToolExecutionRequest):
-    """
-    Receives a tool name and arguments, executes the corresponding
-    function, and returns the result.
-    """
+    """Execute a tool on session data."""
     print(f"Received request to execute tool: {request.tool_name}")
-    print(f"Arguments: {request.arguments}")
+    print(f"For session: {request.chat_session_id}")
     
-    available_tools = {
-        "summarize_data": summarize_data,
-        "generate_echart_config": generate_echart_config,
-        "execute_sql_query": execute_sql_query,  # ✅ ADDED THE MISSING TOOL
-    }
-    
-    function_to_call = available_tools.get(request.tool_name)
+    function_to_call = _get_tool_callable(request.tool_name)
     
     if not function_to_call:
-        available_names = list(available_tools.keys())
+        available_names = list(_available_tools.keys())
         raise HTTPException(
             status_code=404, 
             detail=f"Tool '{request.tool_name}' not found. Available tools: {available_names}"
         )
-        
+    
     try:
-        result = function_to_call(**request.arguments)
+        # Add chat_session_id to tool arguments
+        tool_args = dict(request.arguments)
+        if request.chat_session_id is not None:
+            tool_args["chat_session_id"] = request.chat_session_id
+        result = function_to_call(**tool_args)
         print(f"Tool execution successful")
         return result
     except Exception as e:
@@ -224,9 +241,48 @@ async def execute_tool(request: ToolExecutionRequest):
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "available_tools": ["summarize_data", "generate_echart_config", "execute_sql_query"]}
+    return {"status": "healthy", "available_tools": list(_available_tools.keys())}
 
+
+# ------------------ MCP endpoints ------------------
+
+class MCPToolListResponse(BaseModel):
+    tools: List[ToolSpec]
+
+
+@app.get("/~mcp/tools", response_model=MCPToolListResponse)
+async def list_tools():
+    tool_specs = [
+        ToolSpec(name=name, description=info["description"], parameters=info["parameters"])
+        for name, info in _available_tools.items()
+    ]
+    return {"tools": tool_specs}
+
+
+class MCPExecuteRequest(BaseModel):
+    tool: str
+    arguments: Dict[str, Any]
+
+
+@app.post("/~mcp/execute")
+async def mcp_execute(req: MCPExecuteRequest):
+    tool_func = _get_tool_callable(req.tool)
+    if not tool_func:
+        raise HTTPException(status_code=404, detail=f"Tool '{req.tool}' not found")
+    try:
+        return tool_func(**req.arguments)
+    except TypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/~mcp/healthz")
+async def mcp_health():
+    return {"status": "healthy"}
+
+# Serve .well-known directory if present
+if os.path.isdir(".well-known"):
+    app.mount("/.well-known", StaticFiles(directory=".well-known"), name="well-known")
 
 # --- Main entry point to run the server ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host="0.0.0.0", port=8004)

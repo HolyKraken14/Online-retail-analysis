@@ -7,3 +7,4 @@ python-dotenv
 python-jose
 httpx
 itsdangerous
+openai-mcp
