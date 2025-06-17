@@ -133,7 +133,7 @@ def generate_echart_config(
     file_locations: List[str],
     chart_type: str,
     x_axis: Optional[str] = None,
-    y_axes: Optional[List[str]] = None,
+    y_axis: Optional[List[str]] = None,
     filters: Optional[str] = None
 ) -> Dict:
     """Build an ECharts `option` dict for common charts."""
@@ -148,25 +148,25 @@ def generate_echart_config(
             df = df.query(filters)
         
         option: Dict[str, Any] = {"series": []}
-        
-        if chart_type in ("line","bar") and x_axis and y_axes:
-            df_group = df.groupby(x_axis)[y_axes].sum().reset_index()
+
+        if chart_type in ("line","bar") and x_axis and y_axis:
+            df_group = df.groupby(x_axis)[y_axis].sum().reset_index()
             option.update({
                 "xAxis": {"type": "category", "data": df_group[x_axis].tolist()},
                 "yAxis": {"type": "value"},
                 "tooltip": {"trigger": "axis"},
-                "legend": {"data": y_axes},
+                "legend": {"data": y_axis},
                 "series": [
                     {"name": y, "type": chart_type, "data": df_group[y].tolist()}
-                    for y in y_axes
+                    for y in y_axis
                 ]
             })
-        elif chart_type == "pie" and x_axis and y_axes and len(y_axes)==1:
+        elif chart_type == "pie" and x_axis and y_axis and len(y_axis)==1:
             data = (
-                df.groupby(x_axis)[y_axes[0]]
+                df.groupby(x_axis)[y_axis[0]]
                 .sum().nlargest(10)
                 .reset_index()
-                .rename(columns={x_axis: "name", y_axes[0]: "value"})
+                .rename(columns={x_axis: "name", y_axis[0]: "value"})
             )
             option["series"] = [{
                 "type": "pie",
