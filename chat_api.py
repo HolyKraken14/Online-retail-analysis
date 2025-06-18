@@ -99,12 +99,22 @@ SummarizeDataArgs = create_model(
     __doc__="Return a brief text summary of the dataset: #rows, #cols, missing values, and sample unique values.",
 )
 
+# Tool args for sales trend aggregation
+SalesTrendArgs = create_model(
+    "sales_trend",
+    __doc__="Aggregate sales over time with flexible frequency and filters.",
+    frequency=(str, Field("daily", enum=["daily", "weekly", "monthly", "quarterly"])),
+    start_date=(Optional[str], Field(None)),
+    end_date=(Optional[str], Field(None)),
+    filters=(Optional[Dict[str, Any]], Field(None)),
+)
+
 EchartArgs = create_model(
     'generate_echart_config',
     __doc__="Build an ECharts `option` dict from structured JSON data. Use this AFTER getting data from a SQL query.",
     data=(List[Dict[str, Any]], Field(..., description="The JSON data from a previous SQL query result.")),
     chat_session_id=(str, Field(..., description="The chat session ID to associate this chart with.")),
-    chart_type=(str, Field(..., description="e.g. 'bar' or 'pie'")),
+    chart_type=(str, Field(..., description="Any ECharts series type, e.g. line, bar, pie, scatter, heatmap, radar, treemap, funnel, gauge")),
     x_axis=(str, Field(..., description="The column name to use for the X-axis.")),
     y_axis=(List[str], Field(..., description="The column name(s) to use for the Y-axis.")),
     title=(Optional[str], Field(None, description="A descriptive title for the chart."))
@@ -118,6 +128,7 @@ SQLArgs = create_model(
 
 openai_tools = [
     get_openai_tool_config(SummarizeDataArgs),
+    get_openai_tool_config(SalesTrendArgs),
     get_openai_tool_config(SQLArgs),
     get_openai_tool_config(EchartArgs),
 ]
@@ -282,10 +293,10 @@ async def upload_csv(
     try:
         async with httpx.AsyncClient() as http_client:
             tool_response = await http_client.post(
-                f"{MCP_SERVER_URL}/execute-tool",
+                f"{MCP_SERVER_URL}/~mcp/execute",
                 json={
-                    "tool_name": "summarize_data",
-                    "arguments": {"file_locations": [file_path]}
+                    "tool": "summarize_data",
+                    "arguments": {"file_locations": [file_path], "chat_session_id": chat_session.id}
                 },
                 timeout=60.0
             )
@@ -519,7 +530,7 @@ INSTRUCTIONS:
 5. Column names are case-sensitive
 6. If this is a general greeting (hi, hello, help), respond conversationally
 7. If this relates to previous analysis, reference it appropriately
-
+8. **Use SQLite syntax only. Do not use DATE_TRUNC, :: , EXTRACT, etc.
 RESPONSE FORMAT:
 If this appears to be sales/business data analysis:
 Sales Data: Yes
@@ -540,6 +551,52 @@ Sales Data: No
     print(f"OpenAI response: {response_content}")
 
     # 5. Handle OpenAI response
+    msg = response.choices[0].message
+    metadata_to_save: dict | None = None
+
+    if msg.function_call:
+        func_name = msg.function_call.name
+        raw_args = msg.function_call.arguments or {}
+        if isinstance(raw_args, str):
+            try:
+                func_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                func_args = {}
+        else:
+            func_args = raw_args
+
+        # Always include session id so server-side tools can scope data
+        func_args.setdefault("chat_session_id", session_id)
+
+        # Branch: chart generation is handled entirely by the LLM, no MCP call
+        if func_name == "generate_echart_config":
+            chart_config = func_args  # model already produced final ECharts option
+            assistant_content = "Here is the chart configuration for your request."
+            metadata_to_save = {"type": "chart_config", "echartOption": chart_config}
+        else:
+            # Execute chosen tool via MCP HTTP endpoint
+            try:
+                async with httpx.AsyncClient() as http_client:
+                    tool_resp = await http_client.post(
+                        f"{MCP_SERVER_URL}/~mcp/execute",
+                        json={"tool": func_name, "arguments": func_args},
+                        timeout=60.0,
+                    )
+                    tool_resp.raise_for_status()
+                    tool_result = tool_resp.json()
+            except Exception as e:
+                tool_result = {"error": str(e)}
+
+            assistant_content = f"Executed {func_name}."
+            metadata_to_save = {
+                "type": "analysis_result",
+                "tool": func_name,
+                "arguments": func_args,
+                "result": tool_result,
+            }
+    else:
+        # Model responded with plain text – treat as normal assistant message
+        assistant_content = msg.content.strip() or "I'm not sure how to help with that."
     metadata_to_save = None
     
     if response_content.startswith("Sales Data: No") or "Sales Data: No" in response_content:
@@ -569,13 +626,13 @@ Sales Data: No
                 # Execute SQL via MCP tool with session ID
                 async with httpx.AsyncClient() as http_client:
                     exec_resp = await http_client.post(
-                        f"{MCP_SERVER_URL}/execute-tool",
+                        f"{MCP_SERVER_URL}/~mcp/execute",
                         json={
-                            "tool_name": "execute_sql_query",
+                            "tool": "execute_sql_query",
                             "arguments": {
-                                "sql_query": sql_query
-                            },
-                            "chat_session_id": session_id
+                                "sql_query": sql_query,
+                                "chat_session_id": session_id
+                            }
                         },
                         timeout=60.0
                     )
@@ -595,13 +652,27 @@ Sales Data: No
                     if len(cols) >= 2:
                         chart_prompt = f"""
                         Based on the chat history and current analysis, generate an ECharts configuration:
-                        
+                        **USE SQLLite functions to generate the chart**
                         Previous Context: {chat_history[-500:]}  # Last 500 chars of history
                         Current Query: {message_data.content}
                         Columns: {cols}
                         Sample data: {json.dumps(sql_result['data'][:10])}
-                        
+                        This is the JSON schema for an ECharts config—do not alter its structure or field names:
+    ```json
+    {{
+      "title": {{ /* object */ }},
+      "tooltip": {{ /* object */ }},
+      "xAxis":  {{ /* object */ }},
+      "yAxis":  {{ /* object */ }},
+      "series": [
+        {{ /* object */ }}
+      ]
+    }}
+    ```
+    Use that schema exactly when generating your output.
+
                         Create an appropriate chart (bar, line, pie) showing {cols[1]} by {cols[0]}.
+                        Do not generate the legend for any of the charts
                         Make the title descriptive and relevant to the user's request.
                         """
                         try:

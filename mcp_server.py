@@ -9,6 +9,7 @@ import polars as pl
 import json
 import sqlite3
 import tempfile
+import re  # Added for MySQL→SQLite regex translation
 import os
 from sqlalchemy.orm import Session
 from models import Message
@@ -128,6 +129,84 @@ def get_dataframe_from_session(chat_session_id: str) -> pd.DataFrame:
     finally:
         db.close()
 
+# ----------------- New sales_trend tool -----------------
+
+def sales_trend(
+    chat_session_id: str,
+    frequency: str = "daily",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Aggregate sales over time with flexible frequency and filters.
+
+    Parameters
+    ----------
+    chat_session_id : str
+        Session identifier whose uploaded CSVs will be analysed.
+    frequency : str, optional
+        One of 'daily', 'weekly', 'monthly', 'quarterly'. Defaults to 'daily'.
+    start_date, end_date : str, optional
+        Inclusive ISO-8601 dates (YYYY-MM-DD). If omitted, use full range.
+    filters : dict, optional
+        Additional equality filters, e.g. {"Gender": "Female"}.
+
+    Returns
+    -------
+    dict
+        {"columns": [time_bucket, "TotalSales"], "data": [[bucket, total], ...]}
+    """
+    freq_map = {
+        "daily": "D",
+        "weekly": "W",
+        "monthly": "M",
+        "quarterly": "Q",
+    }
+    if frequency not in freq_map:
+        raise HTTPException(status_code=400, detail="Invalid frequency; choose daily/weekly/monthly/quarterly")
+
+    df = get_dataframe_from_session(chat_session_id)
+    if "InvoiceDate" not in df.columns or "Quantity" not in df.columns or "UnitPrice" not in df.columns:
+        raise HTTPException(status_code=400, detail="Dataset must contain InvoiceDate, Quantity and UnitPrice columns")
+
+    # Parse date column
+    df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], errors="coerce")
+    df = df.dropna(subset=["InvoiceDate"])
+
+    # Apply date range filter
+    if start_date:
+        df = df[df["InvoiceDate"] >= pd.to_datetime(start_date)]
+    if end_date:
+        df = df[df["InvoiceDate"] <= pd.to_datetime(end_date)]
+
+    # Apply arbitrary column filters
+    if filters:
+        for col, val in filters.items():
+            if col not in df.columns:
+                continue
+            if isinstance(val, list):
+                df = df[df[col].isin(val)]
+            else:
+                df = df[df[col] == val]
+
+    # Compute sales amount
+    df["Sales"] = df["Quantity"] * df["UnitPrice"]
+
+    # Resample / group by frequency
+    bucket = df["InvoiceDate"].dt.to_period(freq_map[frequency]).dt.to_timestamp()
+    agg = df.groupby(bucket)["Sales"].sum().reset_index()
+    agg.columns = ["Period", "TotalSales"]
+
+    # Convert to serialisable format
+    data_rows = [[str(row["Period"].date()), float(row["TotalSales"])] for _, row in agg.iterrows()]
+    return {
+        "columns": ["Period", "TotalSales"],
+        "data": data_rows,
+        "total_rows": len(data_rows),
+    }
+
+# ----------------- end new tool -----------------
+
 # Update the tool definitions
 def execute_sql_query(chat_session_id: str, sql_query: str) -> Dict:
     """Execute SQL query on session data using SQLite."""
@@ -148,7 +227,20 @@ def execute_sql_query(chat_session_id: str, sql_query: str) -> Dict:
             raise ValueError("No valid SQL statement found")
         
         sql_query = sql_statements[0]
-        print(f"Cleaned SQL Query: {sql_query}")
+        print(f"Cleaned SQL Query (pre-translate): {sql_query}")
+
+        # --- translate common MySQL date helpers to SQLite equivalents ---
+        def _mysql_to_sqlite(q: str) -> str:
+            """Best-effort string replace for MySQL date helpers so LLM SQL still runs on SQLite."""
+            # STR_TO_DATE(col, '%m/%d/%Y %H:%i') → col  (column already ISO text)
+            q = re.sub(r"STR_TO_DATE\s*\(\s*([A-Za-z0-9_\.]+)\s*,\s*'[^']+'\s*\)", r"\1", q, flags=re.IGNORECASE)
+            # DATE_FORMAT(col, '%Y-%m') → strftime('%Y-%m', col)
+            q = re.sub(r"DATE_FORMAT\s*\(\s*([A-Za-z0-9_\.]+)\s*,\s*'(%Y[^']+)'\s*\)", r"strftime('\2', \1)", q, flags=re.IGNORECASE)
+            # YEARWEEK(col) or YEARWEEK(col,0) → strftime('%Y-%W', col)
+            q = re.sub(r"YEARWEEK\s*\(\s*([A-Za-z0-9_\.]+)(?:\s*,\s*\d+)?\s*\)", r"strftime('%Y-%W', \1)", q, flags=re.IGNORECASE)
+            return q
+        sql_query = _mysql_to_sqlite(sql_query)
+        print(f"SQL after MySQL→SQLite translation: {sql_query}")
         
         # Create temporary SQLite database
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
@@ -196,10 +288,15 @@ _available_tools.update({
         "parameters": _build_parameters_schema(summarize_data),
     },
     "execute_sql_query": {
-        "func": execute_sql_query,
-        "description": "Run a SQL query against session-scoped CSV data.",
-        "parameters": _build_parameters_schema(execute_sql_query),
-    },
+         "func": execute_sql_query,
+         "description": "Run a SQL query against session-scoped CSV data.",
+         "parameters": _build_parameters_schema(execute_sql_query),
+     },
+     "sales_trend": {
+         "func": sales_trend,
+         "description": "Aggregate sales over time with optional date range and column filters.",
+         "parameters": _build_parameters_schema(sales_trend),
+     }
 })
 # ---------------------------------------------------------------------
 
