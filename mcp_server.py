@@ -2,6 +2,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import pandas as pd
@@ -26,14 +27,32 @@ app = FastAPI(
     description="A dedicated server that executes predefined data analysis tools.",
 )
 
-# --- CORS Middleware ---
+# --- CORS Middleware & Auth Middleware ---
+ALLOWED_ORIGINS = [
+    "https://chat.openai.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000"
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# MCP API-key auth (set MCP_API_KEY in environment)
+API_KEY = os.getenv("MCP_API_KEY")
+
+@app.middleware("http")
+async def mcp_auth(request, call_next):
+    # Protect all /~mcp routes in production
+    if request.url.path.startswith("/~mcp"):
+        if API_KEY:  # Only enforce if key is set
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header != f"Bearer {API_KEY}":
+                return JSONResponse(status_code=403, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
 
 # --- Tool Definitions ---
 
@@ -129,83 +148,7 @@ def get_dataframe_from_session(chat_session_id: str) -> pd.DataFrame:
     finally:
         db.close()
 
-# ----------------- New sales_trend tool -----------------
 
-def sales_trend(
-    chat_session_id: str,
-    frequency: str = "daily",
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    filters: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Aggregate sales over time with flexible frequency and filters.
-
-    Parameters
-    ----------
-    chat_session_id : str
-        Session identifier whose uploaded CSVs will be analysed.
-    frequency : str, optional
-        One of 'daily', 'weekly', 'monthly', 'quarterly'. Defaults to 'daily'.
-    start_date, end_date : str, optional
-        Inclusive ISO-8601 dates (YYYY-MM-DD). If omitted, use full range.
-    filters : dict, optional
-        Additional equality filters, e.g. {"Gender": "Female"}.
-
-    Returns
-    -------
-    dict
-        {"columns": [time_bucket, "TotalSales"], "data": [[bucket, total], ...]}
-    """
-    freq_map = {
-        "daily": "D",
-        "weekly": "W",
-        "monthly": "M",
-        "quarterly": "Q",
-    }
-    if frequency not in freq_map:
-        raise HTTPException(status_code=400, detail="Invalid frequency; choose daily/weekly/monthly/quarterly")
-
-    df = get_dataframe_from_session(chat_session_id)
-    if "InvoiceDate" not in df.columns or "Quantity" not in df.columns or "UnitPrice" not in df.columns:
-        raise HTTPException(status_code=400, detail="Dataset must contain InvoiceDate, Quantity and UnitPrice columns")
-
-    # Parse date column
-    df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], errors="coerce")
-    df = df.dropna(subset=["InvoiceDate"])
-
-    # Apply date range filter
-    if start_date:
-        df = df[df["InvoiceDate"] >= pd.to_datetime(start_date)]
-    if end_date:
-        df = df[df["InvoiceDate"] <= pd.to_datetime(end_date)]
-
-    # Apply arbitrary column filters
-    if filters:
-        for col, val in filters.items():
-            if col not in df.columns:
-                continue
-            if isinstance(val, list):
-                df = df[df[col].isin(val)]
-            else:
-                df = df[df[col] == val]
-
-    # Compute sales amount
-    df["Sales"] = df["Quantity"] * df["UnitPrice"]
-
-    # Resample / group by frequency
-    bucket = df["InvoiceDate"].dt.to_period(freq_map[frequency]).dt.to_timestamp()
-    agg = df.groupby(bucket)["Sales"].sum().reset_index()
-    agg.columns = ["Period", "TotalSales"]
-
-    # Convert to serialisable format
-    data_rows = [[str(row["Period"].date()), float(row["TotalSales"])] for _, row in agg.iterrows()]
-    return {
-        "columns": ["Period", "TotalSales"],
-        "data": data_rows,
-        "total_rows": len(data_rows),
-    }
-
-# ----------------- end new tool -----------------
 
 # Update the tool definitions
 def execute_sql_query(chat_session_id: str, sql_query: str) -> Dict:
@@ -245,6 +188,34 @@ def execute_sql_query(chat_session_id: str, sql_query: str) -> Dict:
         # Create temporary SQLite database
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
             conn = sqlite3.connect(tmp.name)
+            # Register custom MEDIAN aggregate so that LLM-generated SQL with MEDIAN works
+            # without breaking existing queries. This is lightweight and scoped to the
+            # in-memory temp DB, so normal flow is unchanged.
+            class _MedianAgg:
+                def __init__(self):
+                    self.values = []
+                def step(self, value):
+                    if value is None:
+                        return
+                    try:
+                        self.values.append(float(value))
+                    except (TypeError, ValueError):
+                        pass
+                def finalize(self):
+                    if not self.values:
+                        return None
+                    self.values.sort()
+                    n = len(self.values)
+                    mid = n // 2
+                    if n % 2 == 1:
+                        return self.values[mid]
+                    return (self.values[mid - 1] + self.values[mid]) / 2
+            try:
+                conn.create_aggregate("median", 1, _MedianAgg)
+                conn.create_aggregate("MEDIAN", 1, _MedianAgg)  # case-insensitive helper
+            except (sqlite3.OperationalError, AttributeError):
+                # If aggregate already exists or cannot be registered, ignore gracefully
+                pass
             
             try:
                 # --- Normalize date column for SQLite compatibility ---
@@ -253,6 +224,21 @@ def execute_sql_query(chat_session_id: str, sql_query: str) -> Dict:
                         df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
                     except Exception as _e:
                         pass  # Leave as-is if conversion fails
+                # --- Safen column names (spaces / special chars) for SQLite ---
+                original_columns = df.columns.tolist()
+                safe_columns = []
+                col_mapping: dict[str, str] = {}
+                for col in original_columns:
+                    safe_col = re.sub(r'\W+', '_', col).strip('_')
+                    col_mapping[col] = safe_col
+                    safe_columns.append(safe_col)
+                if any(orig != safe for orig, safe in zip(original_columns, safe_columns)):
+                    df.columns = safe_columns
+                    # Replace references in SQL query so it matches renamed columns
+                    for orig, safe in col_mapping.items():
+                        if orig != safe:
+                            sql_query = re.sub(rf"\b{re.escape(orig)}\b", safe, sql_query)
+                    print(f"SQL after column-name sanitization: {sql_query}")
                 df.to_sql('csv_table', conn, index=False, if_exists='replace')
                 cursor = conn.cursor()
                 cursor.execute(sql_query)
@@ -292,11 +278,7 @@ _available_tools.update({
          "description": "Run a SQL query against session-scoped CSV data.",
          "parameters": _build_parameters_schema(execute_sql_query),
      },
-     "sales_trend": {
-         "func": sales_trend,
-         "description": "Aggregate sales over time with optional date range and column filters.",
-         "parameters": _build_parameters_schema(sales_trend),
-     }
+
 })
 # ---------------------------------------------------------------------
 

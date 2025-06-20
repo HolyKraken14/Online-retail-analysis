@@ -2,8 +2,67 @@
   "schema_version": "v1",
   "name_for_human": "Retail Data Tools",
   "name_for_model": "retail_data_tools",
-  "description_for_human": "Summarise and query uploaded CSV files.",
-  "description_for_model": "Provides summarize_data and execute_sql_query on session-scoped CSV data.",
-  "model_context_server": { "url": "https://YOUR-DOMAIN/~mcp" },
-  "auth": { "type": "none" }
+  "description_for_human": "Summarise and query uploaded CSV files and generate charts.",
+  "description_for_model": "Offers data-analysis tools: summarize_data, execute_sql_query, generate_echart_config.",
+
+  "model_context_server": {
+    "url": "https://0778-2401-4900-1cbc-275c-60af-47d5-9428-dd9f.ngrok-free.app/~mcp"
+  },
+
+  "auth": {
+    "type": "api_key",
+    "instructions": "Pass `Authorization: Bearer <API_KEY>` header."
+  },
+
+  "tools": {
+    "summarize_data": {
+      "description": "Return a human-readable text summary of uploaded CSV files.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_locations": { "type": "array", "items": { "type": "string" } },
+          "chat_session_id": { "type": "string" }
+        },
+        "required": ["file_locations"]
+      },
+      "output_schema": { "type": "string" }
+    },
+
+    "execute_sql_query": {
+      "description": "Run a SQLite-compatible SQL query on the session CSV table and return rows.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "sql_query": { "type": "string" }
+        },
+        "required": ["sql_query"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "columns": { "type": "array", "items": { "type": "string" } },
+          "data":    { "type": "array", "items": { "type": "array" } }
+        },
+        "required": ["columns", "data"]
+      }
+    },
+
+    "generate_echart_config": {
+      "description": "Convert tabular data into an ECharts option object for visualisation.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "option": { "type": "object" }
+        },
+        "required": ["option"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "series": { "type": "array" }
+        },
+        "required": ["series"]
+      }
+    }
+  }
 }

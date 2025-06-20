@@ -519,7 +519,7 @@ CHAT HISTORY:
 
 CSV SCHEMA AND SAMPLE DATA:
 {schema_description}
-
+File paths: {file_paths}
 CURRENT USER REQUEST: "{message_data.content}"
 
 INSTRUCTIONS:
@@ -636,9 +636,17 @@ Sales Data: No
                         },
                         timeout=60.0
                     )
-                    exec_resp.raise_for_status()
-                    sql_result = exec_resp.json()
-                    print(f"SQL execution result: {sql_result}")
+                    try:
+                        exec_resp.raise_for_status()
+                        sql_result = exec_resp.json()
+                        print(f"SQL execution result: {sql_result}")
+                    except httpx.HTTPStatusError as e:
+                        if exec_resp.status_code == 500:
+                            assistant_content = "Sorry, I am unable to do this task due to a backend error (e.g., unsupported SQL function). Please try rephrasing your request."
+                            metadata_to_save = None
+                            sql_result = None
+                        else:
+                            raise
 
                 # Generate natural language summary with chat context
                 summary = await generate_summary_with_context(
